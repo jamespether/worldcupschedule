@@ -677,4 +677,7 @@ export default function WorldCupSchedule() {
                   onChange={e=>{setTeamSearch(e.target.value);setShowTeamDrop(true)}}
                   onFocus={()=>setShowTeamDrop(true)}
                   placeholder="Filter by team…"
-                  className="w-44 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-[var(--fg)] placeholder-[var(--muted)] outline-non
+                  className="w-44 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-[var(--fg)] placeholder-[var(--muted)] outline-non  
+              </div>
+  )
+}
