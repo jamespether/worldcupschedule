@@ -253,7 +253,7 @@ function getMatchScore(
   todayData: TodayFixture[],
   finishedCache: Record<string, FinishedScore>
 ): ScoreResult | null {
-  // 1. Check live feed
+  // 1. Check live feed for active matches
   const todayMatch = todayData.find(t => matchesTeams(t, match))
   let liveF: LiveFixture | undefined
   if (todayMatch) {
@@ -276,7 +276,22 @@ function getMatchScore(
     }
   }
 
-  // 2. Check finished cache (persists after live feed clears)
+  // 2. Check todayData for finished matches - /api/live only returns currently
+  //    active games, so once a match goes FT it drops off that feed.
+  //    /api/fixtures-today is cached for 6 hours and includes final scores.
+  if (todayMatch && FINISHED_STATUSES.has(todayMatch.status) &&
+      todayMatch.homeGoals !== null && todayMatch.awayGoals !== null) {
+    return {
+      home: todayMatch.homeGoals,
+      away: todayMatch.awayGoals,
+      status: todayMatch.status,
+      elapsed: null,
+      isLive: false,
+      isFinished: true,
+    }
+  }
+
+  // 3. Check persisted finished cache (survives page refresh via localStorage)
   const cacheKey = match.id + ""
   const cached = finishedCache[cacheKey]
   if (cached) {
@@ -477,7 +492,8 @@ function StatCard({ value, label, accent }: { value: string; label: string; acce
 
 // ── GroupTables component ────────────────────────────────────────────────────
 function GroupTables({ tables }: { tables: GroupTable[] }) {
-  const [open, setOpen] = useState(true)
+  // Collapsed by default on all screen sizes - user opens explicitly
+  const [open, setOpen] = useState(false)
   const hasAnyResults = tables.some(t => t.rows.some(r => r.played > 0))
 
   return (
@@ -487,10 +503,12 @@ function GroupTables({ tables }: { tables: GroupTable[] }) {
         className="flex w-full items-center justify-between rounded-2xl border border-white/10 bg-[var(--card-bg)] px-4 py-3 transition hover:bg-white/5"
       >
         <div className="flex items-center gap-3">
-          <span className="font-heading text-sm font-bold uppercase tracking-wide text-[var(--fg)]">Group Tables</span>
-          {!hasAnyResults && (
-            <span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-[var(--muted)]">Updates when matches finish</span>
-          )}
+          <span className="font-heading text-sm font-bold uppercase tracking-wide text-[var(--fg)]">
+            {open ? "Group Tables" : "View Group Tables"}
+          </span>
+          <span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-[var(--muted)]">
+            {hasAnyResults ? "Updates after completed matches" : "Updates when matches finish"}
+          </span>
         </div>
         <ChevronRight className={"h-4 w-4 text-[var(--muted)] transition-transform " + (open ? "rotate-90" : "")} />
       </button>
@@ -699,7 +717,14 @@ export default function WorldCupSchedule() {
   const [nextMatch,     setNextMatch]     = useState<Match|null>(null)
   const [liveData,       setLiveData]       = useState<LiveFixture[]>([])
   const [todayData,      setTodayData]      = useState<TodayFixture[]>([])
-  const [finishedScores, setFinishedScores] = useState<Record<string, FinishedScore>>({})
+  const [finishedScores, setFinishedScores] = useState<Record<string, FinishedScore>>(() => {
+    // Rehydrate from localStorage on first render (client only)
+    if (typeof window === "undefined") return {}
+    try {
+      const raw = localStorage.getItem("wc2026_scores")
+      return raw ? JSON.parse(raw) : {}
+    } catch { return {} }
+  })
   const [apiError,       setApiError]       = useState(false)
   const [refreshing,     setRefreshing]     = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval>|null>(null)
@@ -779,6 +804,14 @@ export default function WorldCupSchedule() {
     pollRef.current = setInterval(fetchLive, 90000)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [fetchLive])
+
+  // Persist finished scores to localStorage so they survive page refresh
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    try {
+      localStorage.setItem("wc2026_scores", JSON.stringify(finishedScores))
+    } catch { /* storage quota or private mode */ }
+  }, [finishedScores])
 
   // Convenience wrapper using component state
   function getScore(match: Match): ScoreResult | null {
