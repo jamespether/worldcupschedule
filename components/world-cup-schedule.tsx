@@ -44,8 +44,17 @@ type TodayFixture = {
   kickoffUTC: string
 }
 
+// Cached final score kept after a match finishes (survives live poll clearing)
+type FinishedScore = {
+  homeTeam:  string
+  awayTeam:  string
+  homeGoals: number
+  awayGoals: number
+  status:    string  // FT | AET | PEN
+}
+
 const ALL_MATCHES: Match[] = [
-  { id:1,  dateKey:"2026-06-11", date:"Thu 11 Jun", time:"20:00", teams:"Mexico vs South Africa",        group:"A", venue:"Mexico City",    watch:"green", channel:"ITV1",    fact:"Mexico & South Africa opened the 2010 World Cup together. South Africa drew 1-1 that day — the last time the tournament was on African soil." },
+  { id:1,  dateKey:"2026-06-11", date:"Thu 11 Jun", time:"20:00", teams:"Mexico vs South Africa",        group:"A", venue:"Mexico City",    watch:"green", channel:"ITV1",    fact:"Mexico & South Africa opened the 2010 World Cup together. South Africa drew 1-1 that day - the last time the tournament was on African soil." },
   { id:2,  dateKey:"2026-06-12", date:"Fri 12 Jun", time:"03:00", teams:"South Korea vs Czechia",        group:"A", venue:"Guadalajara",    watch:"red",   channel:"ITV",     fact:"Son Heung-min will be 34 during this tournament, almost certainly his final World Cup. He is South Korea's all-time record scorer." },
   { id:3,  dateKey:"2026-06-12", date:"Fri 12 Jun", time:"20:00", teams:"Canada vs Bosnia & Herz.",      group:"B", venue:"Toronto",        watch:"green", channel:"BBC One", fact:"Canada are hosting on home soil for the first time. BMO Field holds 45,000 and will be a sold-out home atmosphere." },
   { id:4,  dateKey:"2026-06-13", date:"Sat 13 Jun", time:"02:00", teams:"USA vs Paraguay",               group:"D", venue:"Los Angeles",    watch:"red",   channel:"BBC",     fact:"USA play at SoFi Stadium, the most expensive sports stadium ever built at $5.5bn. As co-hosts they are genuine dark horses." },
@@ -222,8 +231,158 @@ function statusLabel(status: string, elapsed: number | null): string {
   return status
 }
 
-const LIVE_STATUSES = new Set(["1H","HT","2H","ET","PEN"])
-const FINISHED_STATUSES = new Set(["FT","AET"])
+const LIVE_STATUSES     = new Set(["1H","HT","2H","ET","PEN"])
+const FINISHED_STATUSES = new Set(["FT","AET","PEN"])
+const GROUP_STAGE_GROUPS = new Set(["A","B","C","D","E","F","G","H","I","J","K","L"])
+
+// ── Score helper ─────────────────────────────────────────────────────────────
+// Returns the score to show for a match, or null if match not started / no data.
+// Priority: live > cached finished > null
+type ScoreResult = {
+  home: number
+  away: number
+  status: string
+  elapsed: number | null
+  isLive: boolean
+  isFinished: boolean
+}
+
+function getMatchScore(
+  match: Match,
+  liveData: LiveFixture[],
+  todayData: TodayFixture[],
+  finishedCache: Record<string, FinishedScore>
+): ScoreResult | null {
+  // 1. Check live feed
+  const todayMatch = todayData.find(t => matchesTeams(t, match))
+  let liveF: LiveFixture | undefined
+  if (todayMatch) {
+    liveF = liveData.find(l => l.fixtureId === todayMatch.fixtureId)
+  }
+  if (!liveF) liveF = liveData.find(l => matchesTeams(l, match))
+
+  if (liveF) {
+    const isLive     = LIVE_STATUSES.has(liveF.status)
+    const isFinished = FINISHED_STATUSES.has(liveF.status)
+    // Never show 0-0 for a not-started fixture (NS status)
+    if (!isLive && !isFinished) return null
+    return {
+      home: liveF.homeGoals ?? 0,
+      away: liveF.awayGoals ?? 0,
+      status: liveF.status,
+      elapsed: liveF.elapsed,
+      isLive,
+      isFinished,
+    }
+  }
+
+  // 2. Check finished cache (persists after live feed clears)
+  const cacheKey = match.id + ""
+  const cached = finishedCache[cacheKey]
+  if (cached) {
+    return {
+      home: cached.homeGoals,
+      away: cached.awayGoals,
+      status: cached.status,
+      elapsed: null,
+      isLive: false,
+      isFinished: true,
+    }
+  }
+
+  return null
+}
+
+// ── Group table calculation ───────────────────────────────────────────────────
+type TeamRow = {
+  team: string
+  played: number
+  won: number
+  drawn: number
+  lost: number
+  gf: number
+  ga: number
+  gd: number
+  pts: number
+}
+
+type GroupTable = {
+  group: string
+  rows: TeamRow[]
+}
+
+function calculateGroupTables(
+  matches: Match[],
+  liveData: LiveFixture[],
+  todayData: TodayFixture[],
+  finishedCache: Record<string, FinishedScore>
+): GroupTable[] {
+  // Only group-stage matches
+  const groupMatches = matches.filter(m => GROUP_STAGE_GROUPS.has(m.group))
+
+  // Collect all group-stage teams
+  const teamsByGroup: Record<string, Set<string>> = {}
+  groupMatches.forEach(m => {
+    const parts = m.teams.split(" vs ")
+    if (parts.length < 2) return
+    const [home, away] = parts.map(s => s.trim())
+    if (!teamsByGroup[m.group]) teamsByGroup[m.group] = new Set()
+    teamsByGroup[m.group].add(home)
+    teamsByGroup[m.group].add(away)
+  })
+
+  // Build standings from finished scores only
+  const standings: Record<string, Record<string, TeamRow>> = {}
+
+  groupMatches.forEach(m => {
+    const score = getMatchScore(m, liveData, todayData, finishedCache)
+    if (!score || !score.isFinished) return  // skip unfinished
+
+    const parts = m.teams.split(" vs ")
+    if (parts.length < 2) return
+    const [homeTeam, awayTeam] = parts.map(s => s.trim())
+    const g = m.group
+
+    if (!standings[g]) standings[g] = {}
+    const ensure = (t: string) => {
+      if (!standings[g][t]) standings[g][t] = { team:t, played:0, won:0, drawn:0, lost:0, gf:0, ga:0, gd:0, pts:0 }
+    }
+    ensure(homeTeam)
+    ensure(awayTeam)
+
+    const h = standings[g][homeTeam]
+    const a = standings[g][awayTeam]
+    h.played++; a.played++
+    h.gf += score.home; h.ga += score.away
+    a.gf += score.away; a.ga += score.home
+
+    if (score.home > score.away) {
+      h.won++; h.pts += 3; a.lost++
+    } else if (score.home < score.away) {
+      a.won++; a.pts += 3; h.lost++
+    } else {
+      h.drawn++; h.pts++; a.drawn++; a.pts++
+    }
+    h.gd = h.gf - h.ga
+    a.gd = a.gf - a.ga
+  })
+
+  // Build final tables, padding with 0-row teams that have no results yet
+  const groups = ["A","B","C","D","E","F","G","H","I","J","K","L"]
+  return groups.map(g => {
+    const allTeams = teamsByGroup[g] ? Array.from(teamsByGroup[g]) : []
+    const rows: TeamRow[] = allTeams.map(t => {
+      return standings[g]?.[t] ?? { team:t, played:0, won:0, drawn:0, lost:0, gf:0, ga:0, gd:0, pts:0 }
+    })
+    rows.sort((a, b) => {
+      if (b.pts !== a.pts)  return b.pts - a.pts
+      if (b.gd  !== a.gd)  return b.gd  - a.gd
+      if (b.gf  !== a.gf)  return b.gf  - a.gf
+      return a.team.localeCompare(b.team)
+    })
+    return { group: g, rows }
+  })
+}
 
 function toICSDate(dateKey: string, time: string) {
   const [y,m,d] = dateKey.split("-")
@@ -259,17 +418,41 @@ function generateICS(matches: Match[]) {
   return lines.join("\r\n")
 }
 
-function downloadICS(matches: Match[], filename: string): boolean {
+// Detect mobile - iOS Safari and most Android browsers block data: URI downloads.
+// On mobile we open the .ics as a Blob URL in a new tab, which triggers the
+// native "Add to Calendar" prompt. On desktop we use the anchor download trick.
+function isMobile(): boolean {
+  if (typeof navigator === "undefined") return false
+  return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+}
+
+function downloadICS(matches: Match[], filename: string): "downloaded" | "opened" | "error" {
   try {
-    const b64 = btoa(unescape(encodeURIComponent(generateICS(matches))))
-    const a = document.createElement("a")
-    a.href = "data:text/calendar;charset=utf-8;base64," + b64
-    a.download = filename
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    return true
-  } catch { return false }
+    const content = generateICS(matches)
+    const blob = new Blob([content], { type: "text/calendar;charset=utf-8" })
+    const url  = URL.createObjectURL(blob)
+
+    if (isMobile()) {
+      // Mobile: open in new tab - iOS will offer "Add to Calendar", Android
+      // will either prompt or download depending on the browser.
+      window.open(url, "_blank")
+      // Revoke after a delay to allow the browser to read it
+      setTimeout(() => URL.revokeObjectURL(url), 10000)
+      return "opened"
+    } else {
+      // Desktop: trigger a download via hidden anchor
+      const a = document.createElement("a")
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 5000)
+      return "downloaded"
+    }
+  } catch {
+    return "error"
+  }
 }
 
 function ChannelBadge({ channel }: { channel: string }) {
@@ -290,76 +473,200 @@ function StatCard({ value, label, accent }: { value: string; label: string; acce
   )
 }
 
-function LiveScoreBadge({ live }: { live: LiveFixture }) {
-  const isLive = LIVE_STATUSES.has(live.status)
-  const label  = statusLabel(live.status, live.elapsed)
+
+
+// ── GroupTables component ────────────────────────────────────────────────────
+function GroupTables({ tables }: { tables: GroupTable[] }) {
+  const [open, setOpen] = useState(true)
+  const hasAnyResults = tables.some(t => t.rows.some(r => r.played > 0))
+
   return (
-    <div className={"flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-bold " + (isLive ? "bg-[var(--red)]/15 border border-[var(--red)]/30" : "bg-[var(--pitch)]/15 border border-[var(--pitch)]/30")}>
-      {isLive && (
-        <span className="relative flex h-2 w-2 shrink-0">
-          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--red)] opacity-75" />
-          <span className="relative inline-flex rounded-full h-2 w-2 bg-[var(--red)]" />
-        </span>
+    <section className="mx-auto mb-4 max-w-3xl px-5">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex w-full items-center justify-between rounded-2xl border border-white/10 bg-[var(--card-bg)] px-4 py-3 transition hover:bg-white/5"
+      >
+        <div className="flex items-center gap-3">
+          <span className="font-heading text-sm font-bold uppercase tracking-wide text-[var(--fg)]">Group Tables</span>
+          {!hasAnyResults && (
+            <span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-[var(--muted)]">Updates when matches finish</span>
+          )}
+        </div>
+        <ChevronRight className={"h-4 w-4 text-[var(--muted)] transition-transform " + (open ? "rotate-90" : "")} />
+      </button>
+
+      {open && (
+        <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {tables.map(({ group, rows }) => (
+            <div key={group} className="overflow-hidden rounded-2xl border border-white/10 bg-[var(--card-bg)]">
+              <div className="border-b border-white/10 px-3 py-2">
+                <span className="font-heading text-xs font-bold uppercase tracking-widest text-[var(--pitch-bright)]">Group {group}</span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr className="text-[var(--muted)]">
+                      <th className="py-1.5 pl-3 pr-1 text-left font-semibold w-5">#</th>
+                      <th className="py-1.5 px-1 text-left font-semibold">Team</th>
+                      <th className="py-1.5 px-1 text-center font-semibold">P</th>
+                      <th className="py-1.5 px-1 text-center font-semibold">W</th>
+                      <th className="py-1.5 px-1 text-center font-semibold">D</th>
+                      <th className="py-1.5 px-1 text-center font-semibold">L</th>
+                      <th className="py-1.5 px-1 text-center font-semibold">GF</th>
+                      <th className="py-1.5 px-1 text-center font-semibold">GA</th>
+                      <th className="py-1.5 px-1 text-center font-semibold">GD</th>
+                      <th className="py-1.5 pr-3 pl-1 text-center font-semibold text-[var(--pitch-bright)]">Pts</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((row, i) => (
+                      <tr
+                        key={row.team}
+                        className={"border-t border-white/5 " + (i < 2 ? "text-[var(--fg)]" : "text-[var(--muted)]")}
+                      >
+                        <td className="py-1.5 pl-3 pr-1 text-center font-mono">{i + 1}</td>
+                        <td className="py-1.5 px-1 font-medium truncate max-w-[90px]" title={row.team}>{row.team}</td>
+                        <td className="py-1.5 px-1 text-center tabular-nums">{row.played}</td>
+                        <td className="py-1.5 px-1 text-center tabular-nums">{row.won}</td>
+                        <td className="py-1.5 px-1 text-center tabular-nums">{row.drawn}</td>
+                        <td className="py-1.5 px-1 text-center tabular-nums">{row.lost}</td>
+                        <td className="py-1.5 px-1 text-center tabular-nums">{row.gf}</td>
+                        <td className="py-1.5 px-1 text-center tabular-nums">{row.ga}</td>
+                        <td className="py-1.5 px-1 text-center tabular-nums">{row.gd > 0 ? "+" + row.gd : row.gd}</td>
+                        <td className={"py-1.5 pr-3 pl-1 text-center font-bold tabular-nums " + (i < 2 ? "text-[var(--pitch-bright)]" : "")}>{row.pts}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="px-3 py-1.5 text-[9px] text-[var(--muted)]">Top 2 qualify + best 8 third-placed teams</p>
+            </div>
+          ))}
+        </div>
       )}
-      <span className={"tabular-nums text-base font-black " + (isLive ? "text-white" : "text-[var(--pitch-bright)]")}>
-        {live.homeGoals ?? 0} - {live.awayGoals ?? 0}
-      </span>
-      <span className={"text-[10px] font-bold uppercase tracking-wide " + (isLive ? "text-[var(--red)]" : "text-[var(--pitch-bright)]")}>
-        {label}
-      </span>
-    </div>
+    </section>
   )
 }
 
 function CalendarModal({ onClose }: { onClose: () => void }) {
-  const [done, setDone] = useState<string|null>(null)
+  const [result, setResult] = useState<"downloaded"|"opened"|"error"|null>(null)
+  const [selected, setSelected] = useState<string|null>(null)
+  const mobile = typeof navigator !== "undefined" && isMobile()
+
   const options = [
-    { emoji:"G", label:"Prime time games",  sub:"All games without losing sleep", matches:ALL_MATCHES.filter(m=>m.watch==="green"), file:"WC2026-prime-time.ics" },
-    { emoji:"E", label:"England fixtures",  sub:"All group games and knockout slots", matches:ALL_MATCHES.filter(m=>m.teams.includes("England")), file:"WC2026-england.ics" },
-    { emoji:"S", label:"Scotland fixtures", sub:"All group games and knockout slots", matches:ALL_MATCHES.filter(m=>m.teams.includes("Scotland")), file:"WC2026-scotland.ics" },
-    { emoji:"A", label:"Every match",       sub:"All 104 fixtures including late-night games", matches:ALL_MATCHES, file:"WC2026-all.ics" },
+    {
+      id:"prime", emoji:"G", label:"Prime time only",
+      sub: String(ALL_MATCHES.filter(m=>m.watch==="green").length) + " games - all watchable without losing sleep",
+      matches:ALL_MATCHES.filter(m=>m.watch==="green"), file:"WC2026-prime-time.ics"
+    },
+    {
+      id:"england", emoji:"E", label:"England fixtures",
+      sub:"All group games plus knockout slots when known",
+      matches:ALL_MATCHES.filter(m=>m.teams.includes("England")), file:"WC2026-england.ics"
+    },
+    {
+      id:"scotland", emoji:"S", label:"Scotland fixtures",
+      sub:"All group games plus knockout slots when known",
+      matches:ALL_MATCHES.filter(m=>m.teams.includes("Scotland")), file:"WC2026-scotland.ics"
+    },
+    {
+      id:"all", emoji:"A", label:"Every match",
+      sub:"All " + String(ALL_MATCHES.length) + " fixtures including late-night and red-zone games",
+      matches:ALL_MATCHES, file:"WC2026-all.ics"
+    },
   ]
-  function handle(matches: Match[], file: string) {
-    const ok = downloadICS(matches, file)
-    setDone(ok ? "ok" : "err")
-    if (ok) setTimeout(onClose, 2500)
+
+  function handle(matches: Match[], file: string, id: string) {
+    setSelected(id)
+    const outcome = downloadICS(matches, file)
+    setResult(outcome)
+    if (outcome !== "error") setTimeout(onClose, 3000)
   }
+
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center" onClick={onClose}>
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
-      <div className="relative w-full max-w-md rounded-t-3xl sm:rounded-3xl border border-white/10 bg-[var(--card-bg)] shadow-2xl" onClick={e=>e.stopPropagation()}>
+      <div
+        className="relative w-full max-w-md rounded-t-3xl sm:rounded-3xl border border-white/10 bg-[var(--card-bg)] shadow-2xl"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Drag handle on mobile */}
         <div className="flex justify-center pt-3 pb-1 sm:hidden">
           <div className="h-1 w-10 rounded-full bg-white/20" />
         </div>
+
         <div className="p-5">
+          {/* Header */}
           <div className="mb-4 flex items-start justify-between">
             <div>
-              <h2 className="font-heading text-lg font-bold uppercase tracking-wide text-[var(--fg)]">Add to Calendar</h2>
-              <p className="mt-0.5 text-xs text-[var(--muted)]">Choose what to download then open the .ics file to import</p>
+              <h2 className="font-heading text-lg font-bold uppercase tracking-wide text-[var(--fg)]">
+                Add to Calendar
+              </h2>
+              <p className="mt-0.5 text-xs text-[var(--muted)]">
+                {mobile
+                  ? "Tap an option - it will open in a new tab, then tap Allow to add to your calendar"
+                  : "Choose what to download - then open the .ics file to import"}
+              </p>
             </div>
             <button onClick={onClose} className="rounded-full p-1.5 text-[var(--muted)] hover:bg-white/10">
               <X className="h-4 w-4" />
             </button>
           </div>
-          {done === "err" && (
-            <p className="mb-3 rounded-xl border border-[var(--red)]/40 bg-[var(--red)]/10 px-3 py-2 text-xs text-[var(--red)]">
-              Download failed. Try a different browser or open on desktop.
-            </p>
-          )}
-          {done === "ok" && (
-            <div className="mb-3 flex items-center gap-2 rounded-xl border border-[var(--pitch)]/40 bg-[var(--pitch)]/10 px-3 py-2.5">
-              <CheckCircle className="h-4 w-4 shrink-0 text-[var(--pitch-bright)]" />
-              <div>
-                <p className="text-xs font-bold text-[var(--pitch-bright)]">Downloaded!</p>
-                <p className="text-[11px] text-[var(--muted)]">Open the .ics file and it will open in your calendar app automatically</p>
+
+          {/* Mobile tip */}
+          {mobile && !result && (
+            <div className="mb-3 flex items-start gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2.5">
+              <span className="mt-0.5 text-base leading-none">📱</span>
+              <div className="text-[11px] text-[var(--muted)] leading-relaxed">
+                <strong className="text-[var(--fg)]">iPhone:</strong> Opens in Safari - tap the Share button then "Add to Calendar"<br />
+                <strong className="text-[var(--fg)]">Android:</strong> Opens a download - tap the file to import into Google Calendar
               </div>
             </div>
           )}
+
+          {/* Result states */}
+          {result === "error" && (
+            <div className="mb-3 rounded-xl border border-[var(--red)]/40 bg-[var(--red)]/10 px-3 py-2.5">
+              <p className="text-xs font-bold text-[var(--red)]">Could not open the calendar file</p>
+              <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                Try opening this page on a desktop browser instead, or email yourself the link and open it on your laptop.
+              </p>
+            </div>
+          )}
+          {result === "opened" && (
+            <div className="mb-3 flex items-start gap-2 rounded-xl border border-[var(--pitch)]/40 bg-[var(--pitch)]/10 px-3 py-2.5">
+              <CheckCircle className="h-4 w-4 mt-0.5 shrink-0 text-[var(--pitch-bright)]" />
+              <div>
+                <p className="text-xs font-bold text-[var(--pitch-bright)]">Opened in a new tab</p>
+                <p className="text-[11px] text-[var(--muted)] mt-0.5">
+                  iPhone: tap the Share icon then "Add to Calendar"<br />
+                  Android: tap the downloaded file to import
+                </p>
+              </div>
+            </div>
+          )}
+          {result === "downloaded" && (
+            <div className="mb-3 flex items-center gap-2 rounded-xl border border-[var(--pitch)]/40 bg-[var(--pitch)]/10 px-3 py-2.5">
+              <CheckCircle className="h-4 w-4 shrink-0 text-[var(--pitch-bright)]" />
+              <div>
+                <p className="text-xs font-bold text-[var(--pitch-bright)]">File downloaded</p>
+                <p className="text-[11px] text-[var(--muted)]">Open the .ics file - it will import straight into your calendar app</p>
+              </div>
+            </div>
+          )}
+
+          {/* Options */}
           <div className="space-y-2">
             {options.map(opt => (
-              <button key={opt.file} onClick={()=>handle(opt.matches,opt.file)}
-                className="flex w-full items-center gap-3 rounded-2xl border border-white/8 bg-white/4 p-3.5 text-left transition hover:bg-white/8 active:scale-[0.98]">
-                <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-xs font-bold text-[var(--fg)]">{opt.emoji}</span>
+              <button
+                key={opt.id}
+                onClick={() => handle(opt.matches, opt.file, opt.id)}
+                disabled={selected === opt.id && result !== null && result !== "error"}
+                className={"flex w-full items-center gap-3 rounded-2xl border p-3.5 text-left transition active:scale-[0.98] " + (selected === opt.id && result !== null ? "border-[var(--pitch)]/40 bg-[var(--pitch)]/10" : "border-white/8 bg-white/4 hover:bg-white/8")}
+              >
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white/10 text-xs font-bold text-[var(--fg)]">
+                  {opt.emoji}
+                </span>
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-semibold text-[var(--fg)]">{opt.label}</p>
                   <p className="text-[11px] text-[var(--muted)]">{opt.sub}</p>
@@ -368,7 +675,10 @@ function CalendarModal({ onClose }: { onClose: () => void }) {
               </button>
             ))}
           </div>
-          <p className="mt-4 text-center text-[10px] text-[var(--muted)]">All times BST - Channel info in event description</p>
+
+          <p className="mt-4 text-center text-[10px] text-[var(--muted)]">
+            All times BST - Channel info included in each event
+          </p>
         </div>
       </div>
     </div>
@@ -387,9 +697,11 @@ export default function WorldCupSchedule() {
   const [showCalModal,  setShowCalModal]  = useState(false)
   const [countdown,     setCountdown]     = useState("")
   const [nextMatch,     setNextMatch]     = useState<Match|null>(null)
-  const [liveData,      setLiveData]      = useState<LiveFixture[]>([])
-  const [todayData,     setTodayData]     = useState<TodayFixture[]>([])
-  const [apiError,      setApiError]      = useState(false)
+  const [liveData,       setLiveData]       = useState<LiveFixture[]>([])
+  const [todayData,      setTodayData]      = useState<TodayFixture[]>([])
+  const [finishedScores, setFinishedScores] = useState<Record<string, FinishedScore>>({})
+  const [apiError,       setApiError]       = useState(false)
+  const [refreshing,     setRefreshing]     = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval>|null>(null)
 
   const teamSearch = teamSearchRaw.toLowerCase()
@@ -422,16 +734,42 @@ export default function WorldCupSchedule() {
       .catch(() => {})
   }, [today])
 
-  const fetchLive = useCallback(async () => {
-    if (!isLiveWindow()) return
+  const fetchLive = useCallback(async (manual = false) => {
+    if (!manual && !isLiveWindow()) return
+    if (manual) setRefreshing(true)
     try {
       const r = await fetch("/api/live")
       if (!r.ok) throw new Error("bad response")
       const d = await r.json()
-      setLiveData(d.live || [])
+      const incoming: LiveFixture[] = d.live || []
+      setLiveData(incoming)
       setApiError(false)
+
+      // Cache any newly-finished scores so they persist after the live feed clears
+      const finished = incoming.filter(l => FINISHED_STATUSES.has(l.status))
+      if (finished.length > 0) {
+        setFinishedScores(prev => {
+          const next = { ...prev }
+          finished.forEach(lf => {
+            // Find the matching match to get its id as cache key
+            const match = ALL_MATCHES.find(m => matchesTeams(lf, m))
+            if (match && lf.homeGoals !== null && lf.awayGoals !== null) {
+              next[match.id + ""] = {
+                homeTeam:  lf.homeTeam,
+                awayTeam:  lf.awayTeam,
+                homeGoals: lf.homeGoals,
+                awayGoals: lf.awayGoals,
+                status:    lf.status,
+              }
+            }
+          })
+          return next
+        })
+      }
     } catch {
       setApiError(true)
+    } finally {
+      if (manual) setRefreshing(false)
     }
   }, [])
 
@@ -442,14 +780,9 @@ export default function WorldCupSchedule() {
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [fetchLive])
 
-  function getLiveFixture(match: Match): LiveFixture | null {
-    if (liveData.length === 0) return null
-    const todayMatch = todayData.find(t => matchesTeams(t, match))
-    if (todayMatch) {
-      const byId = liveData.find(l => l.fixtureId === todayMatch.fixtureId)
-      if (byId) return byId
-    }
-    return liveData.find(l => matchesTeams(l, match)) || null
+  // Convenience wrapper using component state
+  function getScore(match: Match): ScoreResult | null {
+    return getMatchScore(match, liveData, todayData, finishedScores)
   }
 
   const grouped = useMemo(() => {
@@ -470,6 +803,10 @@ export default function WorldCupSchedule() {
   const totalWatchable = ALL_MATCHES.filter(m => m.watch === "green").length
   const filteredTeams  = TEAM_LIST.filter(t => t.toLowerCase().includes(teamSearch)).slice(0,12)
   const anyLive        = liveData.some(l => LIVE_STATUSES.has(l.status))
+  const groupTables    = useMemo(
+    () => calculateGroupTables(ALL_MATCHES, liveData, todayData, finishedScores),
+    [liveData, todayData, finishedScores]
+  )
 
   return (
     <div className="min-h-screen bg-[var(--bg)] font-sans text-[var(--fg)] pb-20" onClick={() => setShowTeamDrop(false)}>
@@ -518,8 +855,19 @@ export default function WorldCupSchedule() {
               </button>
             )}
           </div>
+          {/* Manual refresh button - shown in live window, low-profile */}
+          <div className="mt-3 flex justify-center">
+            <button
+              onClick={() => fetchLive(true)}
+              disabled={refreshing}
+              className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-4 py-1.5 text-[10px] font-semibold text-[var(--muted)] transition hover:bg-white/10 disabled:opacity-50"
+            >
+              <Clock className={"h-3 w-3 " + (refreshing ? "animate-spin" : "")} />
+              {refreshing ? "Refreshing..." : "Refresh scores"}
+            </button>
+          </div>
           {apiError && (
-            <p className="mt-3 text-[10px] text-[var(--muted)]">Live scores unavailable - schedule still accurate</p>
+            <p className="mt-2 text-[10px] text-[var(--muted)]">Live scores unavailable - schedule still accurate</p>
           )}
         </div>
       </header>
@@ -604,6 +952,8 @@ export default function WorldCupSchedule() {
         </div>
       )}
 
+      <GroupTables tables={groupTables} />
+
       <main className="mx-auto max-w-3xl space-y-2 px-5">
         {grouped.length===0 && (
           <div className="py-16 text-center text-[var(--muted)]">
@@ -614,7 +964,7 @@ export default function WorldCupSchedule() {
         {grouped.map(day => {
           const isCollapsed = collapsedDays[day.dateKey]
           const hasClash    = day.matches.some(m=>m.simultaneous)
-          const dayHasLive  = day.matches.some(m => { const lf = getLiveFixture(m); return lf && LIVE_STATUSES.has(lf.status) })
+          const dayHasLive  = day.matches.some(m => { const s = getScore(m); return s?.isLive })
           return (
             <div key={day.dateKey}>
               <button onClick={()=>toggleDay(day.dateKey)}
@@ -655,22 +1005,22 @@ export default function WorldCupSchedule() {
                     const factOpen = expandedFact === fk
                     const isKO     = ["R32","R16","QF","SF","3RD","FINAL"].includes(match.group)
                     const stageColor = STAGE_COLORS[match.group] || "#94a3b8"
-                    const liveF    = getLiveFixture(match)
-                    const isLiveNow = liveF && LIVE_STATUSES.has(liveF.status)
-                    const isDoneNow = liveF && FINISHED_STATUSES.has(liveF.status)
+                    const score     = getScore(match)
+                    const isLiveNow = score?.isLive ?? false
+                    const isDoneNow = score?.isFinished ?? false
                     return (
                       <article key={match.id}
                         className={"rounded-2xl border p-3.5 transition " + (isLiveNow ? "border-[var(--red)]/25 bg-[var(--red)]/5" : match.simultaneous ? "border-[var(--amber)]/20 bg-[var(--amber)]/5" : "border-white/8 bg-[var(--card-bg)]")}>
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div className="flex items-start gap-3">
                             <div className="w-14 shrink-0">
-                              {liveF ? (
+                              {score ? (
                                 <div>
                                   <p className="font-heading text-lg font-black leading-none tabular-nums text-white">
-                                    {liveF.homeGoals ?? 0}-{liveF.awayGoals ?? 0}
+                                    {score.home}-{score.away}
                                   </p>
                                   <p className={"mt-0.5 text-[9px] font-bold uppercase tracking-wide " + (isLiveNow ? "text-[var(--red)]" : "text-[var(--pitch-bright)]")}>
-                                    {statusLabel(liveF.status, liveF.elapsed)}
+                                    {statusLabel(score.status, score.elapsed)}
                                   </p>
                                 </div>
                               ) : (
@@ -713,23 +1063,40 @@ export default function WorldCupSchedule() {
                                   <MapPin className="h-3 w-3" /> {match.venue}
                                 </span>
                               </div>
-                              {liveF && liveF.events.length > 0 && (
-                                <div className="mt-2 flex flex-wrap gap-1">
-                                  {liveF.events.map((e,i) => (
-                                    <span key={i} className="inline-flex items-center gap-1 rounded-full bg-white/8 px-2 py-0.5 text-[10px] text-[var(--fg)]">
-                                      Goal {e.player} {e.minute}
-                                    </span>
-                                  ))}
-                                </div>
-                              )}
-                              {match.note && !liveF && (
+                              {isLiveNow && (() => {
+                                const todayM = todayData.find(t => matchesTeams(t, match))
+                                const lf = todayM ? liveData.find(l => l.fixtureId === todayM.fixtureId) : liveData.find(l => matchesTeams(l, match))
+                                return lf && lf.events.length > 0 ? (
+                                  <div className="mt-2 flex flex-wrap gap-1">
+                                    {lf.events.map((e,i) => (
+                                      <span key={i} className="inline-flex items-center gap-1 rounded-full bg-white/8 px-2 py-0.5 text-[10px] text-[var(--fg)]">
+                                        Goal {e.player} {e.minute}
+                                      </span>
+                                    ))}
+                                  </div>
+                                ) : null
+                              })()}
+                              {match.note && !score && (
                                 <p className="mt-1 text-[11px] font-semibold italic text-[var(--gold)]">{match.note}</p>
                               )}
                             </div>
                           </div>
                           <div className="flex flex-col items-end gap-1.5">
-                            {liveF ? (
-                              <LiveScoreBadge live={liveF} />
+                            {score ? (
+                              <div className={"flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-bold " + (isLiveNow ? "bg-[var(--red)]/15 border border-[var(--red)]/30" : "bg-[var(--pitch)]/15 border border-[var(--pitch)]/30")}>
+                                {isLiveNow && (
+                                  <span className="relative flex h-2 w-2 shrink-0">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--red)] opacity-75" />
+                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-[var(--red)]" />
+                                  </span>
+                                )}
+                                <span className={"tabular-nums text-base font-black " + (isLiveNow ? "text-white" : "text-[var(--pitch-bright)]")}>
+                                  {score.home} - {score.away}
+                                </span>
+                                <span className={"text-[10px] font-bold uppercase tracking-wide " + (isLiveNow ? "text-[var(--red)]" : "text-[var(--pitch-bright)]")}>
+                                  {statusLabel(score.status, score.elapsed)}
+                                </span>
+                              </div>
                             ) : (
                               <span className={"whitespace-nowrap rounded-full px-2.5 py-1 text-[10px] font-bold " + WATCH[match.watch].chip}>
                                 {WATCH[match.watch].label}
