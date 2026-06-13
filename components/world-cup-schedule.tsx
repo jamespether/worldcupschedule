@@ -55,6 +55,25 @@ type ResultFixture = {
   kickoffUTC: string
 }
 
+// ── OpenFootball types ──────────────────────────────────────────────────────
+type OpenFootballScore = {
+  ft?: [number, number]
+  ht?: [number, number]
+  et?: [number, number]
+  p?:  [number, number]
+}
+
+type OpenFootballMatch = {
+  round: string
+  date:  string
+  time?: string
+  team1: string
+  team2: string
+  group?: string
+  ground?: string
+  score?: OpenFootballScore
+}
+
 // Cached final score kept after a match finishes (survives live poll clearing)
 type FinishedScore = {
   homeTeam:  string
@@ -258,6 +277,127 @@ type ScoreResult = {
   isFinished: boolean
 }
 
+// ── OpenFootball helpers ────────────────────────────────────────────────────
+const TEAM_ALIASES: Record<string, string> = {
+  "usa":                          "usa",
+  "united states":                "usa",
+  "czech republic":               "czechia",
+  "czechia":                      "czechia",
+  "south korea":                  "south korea",
+  "korea republic":               "south korea",
+  "korea":                        "south korea",
+  "ivory coast":                  "ivory coast",
+  "cote d'ivoire":                "ivory coast",
+  "cote divoire":                 "ivory coast",
+  "bosnia":                       "bosnia & herz.",
+  "bosnia and herzegovina":       "bosnia & herz.",
+  "bosnia & herz.":               "bosnia & herz.",
+  "bosnia & herzegovina":         "bosnia & herz.",
+  "dr congo":                     "dr congo",
+  "congo dr":                     "dr congo",
+  "democratic republic of congo": "dr congo",
+}
+
+function normaliseTeamName(name: string): string {
+  const lower = name.toLowerCase().trim()
+  return TEAM_ALIASES[lower] ?? lower
+}
+
+function findOpenFootballMatch(
+  appMatch: Match,
+  ofMatches: OpenFootballMatch[]
+): OpenFootballMatch | undefined {
+  // Extract home/away from "Home vs Away" format
+  const parts = appMatch.teams.split(" vs ")
+  if (parts.length < 2) return undefined
+  const appHome = normaliseTeamName(parts[0].trim())
+  const appAway = normaliseTeamName(parts[1].trim())
+
+  return ofMatches.find(of => {
+    const ofHome = normaliseTeamName(of.team1)
+    const ofAway = normaliseTeamName(of.team2)
+    // Match by normalised team names - date matching is unreliable due to BST/UTC offsets
+    return ofHome === appHome && ofAway === appAway
+  })
+}
+
+function getMatchScoreFromOF(
+  appMatch: Match,
+  ofMatches: OpenFootballMatch[]
+): ScoreResult | null {
+  const of = findOpenFootballMatch(appMatch, ofMatches)
+  if (!of?.score?.ft) return null
+  return {
+    home:       of.score.ft[0],
+    away:       of.score.ft[1],
+    status:     "FT",
+    elapsed:    null,
+    isLive:     false,
+    isFinished: true,
+  }
+}
+
+function calculateGroupTablesFromOF(ofMatches: OpenFootballMatch[]): GroupTable[] {
+  const GROUP_LETTERS = ["A","B","C","D","E","F","G","H","I","J","K","L"]
+
+  // Build team set and standings from OpenFootball group matches with FT scores
+  const standings: Record<string, Record<string, TeamRow>> = {}
+  const teamsByGroup: Record<string, Set<string>> = {}
+
+  ofMatches.forEach(of => {
+    if (!of.group) return
+    // Extract group letter from strings like "Group A" or just "A"
+    const groupLetter = of.group.replace(/^Group\s*/i, "").trim().toUpperCase()
+    if (!GROUP_LETTERS.includes(groupLetter)) return
+
+    const home = of.team1.trim()
+    const away = of.team2.trim()
+
+    if (!teamsByGroup[groupLetter]) teamsByGroup[groupLetter] = new Set()
+    teamsByGroup[groupLetter].add(home)
+    teamsByGroup[groupLetter].add(away)
+
+    if (!of.score?.ft) return // no result yet - still add teams above
+
+    const [hg, ag] = of.score.ft
+    if (!standings[groupLetter]) standings[groupLetter] = {}
+
+    const ensure = (t: string) => {
+      if (!standings[groupLetter][t])
+        standings[groupLetter][t] = { team:t, played:0, won:0, drawn:0, lost:0, gf:0, ga:0, gd:0, pts:0 }
+    }
+    ensure(home)
+    ensure(away)
+
+    const h = standings[groupLetter][home]
+    const a = standings[groupLetter][away]
+    h.played++; a.played++
+    h.gf += hg; h.ga += ag
+    a.gf += ag; a.ga += hg
+
+    if (hg > ag)       { h.won++; h.pts += 3; a.lost++ }
+    else if (hg < ag)  { a.won++; a.pts += 3; h.lost++ }
+    else               { h.drawn++; h.pts++;   a.drawn++; a.pts++ }
+
+    h.gd = h.gf - h.ga
+    a.gd = a.gf - a.ga
+  })
+
+  return GROUP_LETTERS.map(g => {
+    const teams = teamsByGroup[g] ? Array.from(teamsByGroup[g]) : []
+    const rows: TeamRow[] = teams.map(t =>
+      standings[g]?.[t] ?? { team:t, played:0, won:0, drawn:0, lost:0, gf:0, ga:0, gd:0, pts:0 }
+    )
+    rows.sort((a, b) => {
+      if (b.pts !== a.pts) return b.pts - a.pts
+      if (b.gd  !== a.gd)  return b.gd  - a.gd
+      if (b.gf  !== a.gf)  return b.gf  - a.gf
+      return a.team.localeCompare(b.team)
+    })
+    return { group: g, rows }
+  })
+}
+
 function getMatchScore(
   match: Match,
   liveData: LiveFixture[],
@@ -334,6 +474,25 @@ type TeamRow = {
 type GroupTable = {
   group: string
   rows: TeamRow[]
+}
+
+// Shape returned by /api/standings (official API-Football standings)
+type ApiStandingRow = {
+  rank:   number
+  team:   string
+  played: number
+  won:    number
+  drawn:  number
+  lost:   number
+  gf:     number
+  ga:     number
+  gd:     number
+  pts:    number
+}
+
+type ApiStanding = {
+  group: string
+  rows:  ApiStandingRow[]
 }
 
 function calculateGroupTables(
@@ -517,7 +676,7 @@ function GroupTables({ tables }: { tables: GroupTable[] }) {
             {open ? "Group Tables" : "View Group Tables"}
           </span>
           <span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-[var(--muted)]">
-            {hasAnyResults ? "Updates after completed matches" : "Updates when matches finish"}
+            {hasAnyResults ? "Group tables update when OpenFootball publishes completed results." : "Group tables update when OpenFootball publishes completed results."}
           </span>
         </div>
         <ChevronRight className={"h-4 w-4 text-[var(--muted)] transition-transform " + (open ? "rotate-90" : "")} />
@@ -725,9 +884,12 @@ export default function WorldCupSchedule() {
   const [showCalModal,  setShowCalModal]  = useState(false)
   const [countdown,     setCountdown]     = useState("")
   const [nextMatch,     setNextMatch]     = useState<Match|null>(null)
-  const [liveData,       setLiveData]       = useState<LiveFixture[]>([])
-  const [todayData,      setTodayData]      = useState<TodayFixture[]>([])
-  const [resultsData,    setResultsData]    = useState<ResultFixture[]>([])
+  const [liveData,             setLiveData]             = useState<LiveFixture[]>([])
+  const [todayData,            setTodayData]            = useState<TodayFixture[]>([])
+  const [resultsData,          setResultsData]          = useState<ResultFixture[]>([])
+  const [apiStandings,         setApiStandings]         = useState<ApiStanding[]>([])
+  const [openFootballMatches,  setOpenFootballMatches]  = useState<OpenFootballMatch[]>([])
+  const [ofError,              setOfError]              = useState(false)
   const [finishedScores, setFinishedScores] = useState<Record<string, FinishedScore>>(() => {
     // Rehydrate from localStorage on first render (client only)
     if (typeof window === "undefined") return {}
@@ -770,13 +932,36 @@ export default function WorldCupSchedule() {
       .catch(() => {})
   }, [today])
 
-  // Fetch all results since tournament start - the primary source for
-  // finished scores and group table calculations across all matchdays.
+  // Fetch all results since tournament start - primary source for finished scores.
   useEffect(() => {
     fetch("/api/results")
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (d?.fixtures) setResultsData(d.fixtures) })
       .catch(() => {})
+  }, [])
+
+  // Fetch official standings from API-Football - used for group tables.
+  // More reliable than calculating from fixture data since API does it server-side.
+  // Cached 1 hour on the route. Refetched on each page load.
+  useEffect(() => {
+    fetch("/api/standings")
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.standings) setApiStandings(d.standings) })
+      .catch(() => {})
+  }, [])
+
+  // Fetch OpenFootball data - primary source for finished scores and group tables.
+  // No API key needed. Cached 1 hour on the route.
+  useEffect(() => {
+    fetch("/api/openfootball")
+      .then(r => r.ok ? r.json() : Promise.reject(r))
+      .then(d => {
+        // OpenFootball format: { matches: [...] }
+        const matches: OpenFootballMatch[] = d?.matches ?? []
+        setOpenFootballMatches(matches)
+        setOfError(false)
+      })
+      .catch(() => setOfError(true))
   }, [])
 
   const fetchLive = useCallback(async (manual = false) => {
@@ -833,9 +1018,14 @@ export default function WorldCupSchedule() {
     } catch { /* storage quota or private mode */ }
   }, [finishedScores])
 
-  // Convenience wrapper using component state
+  // Score lookup: OpenFootball (finished) > liveData (live) > old API cache
   function getScore(match: Match): ScoreResult | null {
-    return getMatchScore(match, liveData, resultsData, finishedScores)
+    // 1. OpenFootball - most reliable source for finished scores
+    const ofScore = getMatchScoreFromOF(match, openFootballMatches)
+    if (ofScore) return ofScore
+    // 2. Live feed for in-progress matches
+    const liveScore = getMatchScore(match, liveData, resultsData, finishedScores)
+    return liveScore
   }
 
   const grouped = useMemo(() => {
@@ -856,10 +1046,29 @@ export default function WorldCupSchedule() {
   const totalWatchable = ALL_MATCHES.filter(m => m.watch === "green").length
   const filteredTeams  = TEAM_LIST.filter(t => t.toLowerCase().includes(teamSearch)).slice(0,12)
   const anyLive        = liveData.some(l => LIVE_STATUSES.has(l.status))
-  const groupTables    = useMemo(
-    () => calculateGroupTables(ALL_MATCHES, liveData, resultsData, finishedScores),
-    [liveData, resultsData, finishedScores]
-  )
+  // Group tables: prefer OpenFootball (no API key) > API standings > local calc
+  const groupTables = useMemo((): GroupTable[] => {
+    if (openFootballMatches.length > 0) {
+      return calculateGroupTablesFromOF(openFootballMatches)
+    }
+    if (apiStandings.length > 0) {
+      return apiStandings.map(s => ({
+        group: s.group,
+        rows: s.rows.map(r => ({
+          team:   r.team,
+          played: r.played,
+          won:    r.won,
+          drawn:  r.drawn,
+          lost:   r.lost,
+          gf:     r.gf,
+          ga:     r.ga,
+          gd:     r.gd,
+          pts:    r.pts,
+        })),
+      }))
+    }
+    return calculateGroupTables(ALL_MATCHES, liveData, resultsData, finishedScores)
+  }, [openFootballMatches, apiStandings, liveData, resultsData, finishedScores])
 
   return (
     <div className="min-h-screen bg-[var(--bg)] font-sans text-[var(--fg)] pb-20" onClick={() => setShowTeamDrop(false)}>
@@ -921,6 +1130,9 @@ export default function WorldCupSchedule() {
           </div>
           {apiError && (
             <p className="mt-2 text-[10px] text-[var(--muted)]">Live scores unavailable - schedule still accurate</p>
+          )}
+          {ofError && (
+            <p className="mt-1 text-[10px] text-[var(--muted)]">Results are temporarily unavailable.</p>
           )}
         </div>
       </header>
