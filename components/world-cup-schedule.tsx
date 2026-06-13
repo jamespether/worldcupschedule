@@ -44,6 +44,17 @@ type TodayFixture = {
   kickoffUTC: string
 }
 
+// Fixture returned by /api/results - covers all matchdays from start to today
+type ResultFixture = {
+  fixtureId:  number
+  status:     string   // FT | AET | PEN (only finished matches have goals)
+  homeTeam:   string
+  awayTeam:   string
+  homeGoals:  number | null
+  awayGoals:  number | null
+  kickoffUTC: string
+}
+
 // Cached final score kept after a match finishes (survives live poll clearing)
 type FinishedScore = {
   homeTeam:  string
@@ -250,21 +261,15 @@ type ScoreResult = {
 function getMatchScore(
   match: Match,
   liveData: LiveFixture[],
-  todayData: TodayFixture[],
+  resultsData: ResultFixture[],
   finishedCache: Record<string, FinishedScore>
 ): ScoreResult | null {
-  // 1. Check live feed for active matches
-  const todayMatch = todayData.find(t => matchesTeams(t, match))
-  let liveF: LiveFixture | undefined
-  if (todayMatch) {
-    liveF = liveData.find(l => l.fixtureId === todayMatch.fixtureId)
-  }
-  if (!liveF) liveF = liveData.find(l => matchesTeams(l, match))
-
+  // 1. liveData - active live matches only
+  const liveF = liveData.find(l => matchesTeams(l, match))
   if (liveF) {
     const isLive     = LIVE_STATUSES.has(liveF.status)
     const isFinished = FINISHED_STATUSES.has(liveF.status)
-    // Never show 0-0 for a not-started fixture (NS status)
+    // Do not show 0-0 for a not-started fixture
     if (!isLive && !isFinished) return null
     return {
       home: liveF.homeGoals ?? 0,
@@ -276,22 +281,27 @@ function getMatchScore(
     }
   }
 
-  // 2. Check todayData for finished matches - /api/live only returns currently
-  //    active games, so once a match goes FT it drops off that feed.
-  //    /api/fixtures-today is cached for 6 hours and includes final scores.
-  if (todayMatch && FINISHED_STATUSES.has(todayMatch.status) &&
-      todayMatch.homeGoals !== null && todayMatch.awayGoals !== null) {
+  // 2. resultsData from /api/results - all finished matches since tournament start.
+  //    This is the primary source for previous matchday scores and group tables.
+  //    Only use when homeGoals and awayGoals are confirmed (not null).
+  const result = resultsData.find(r =>
+    FINISHED_STATUSES.has(r.status) &&
+    r.homeGoals !== null &&
+    r.awayGoals !== null &&
+    matchesTeams(r, match)
+  )
+  if (result) {
     return {
-      home: todayMatch.homeGoals,
-      away: todayMatch.awayGoals,
-      status: todayMatch.status,
+      home: result.homeGoals as number,
+      away: result.awayGoals as number,
+      status: result.status,
       elapsed: null,
       isLive: false,
       isFinished: true,
     }
   }
 
-  // 3. Check persisted finished cache (survives page refresh via localStorage)
+  // 3. localStorage cache - fallback for scores seen in the live feed this session
   const cacheKey = match.id + ""
   const cached = finishedCache[cacheKey]
   if (cached) {
@@ -329,7 +339,7 @@ type GroupTable = {
 function calculateGroupTables(
   matches: Match[],
   liveData: LiveFixture[],
-  todayData: TodayFixture[],
+  resultsData: ResultFixture[],
   finishedCache: Record<string, FinishedScore>
 ): GroupTable[] {
   // Only group-stage matches
@@ -350,7 +360,7 @@ function calculateGroupTables(
   const standings: Record<string, Record<string, TeamRow>> = {}
 
   groupMatches.forEach(m => {
-    const score = getMatchScore(m, liveData, todayData, finishedCache)
+    const score = getMatchScore(m, liveData, resultsData, finishedCache)
     if (!score || !score.isFinished) return  // skip unfinished
 
     const parts = m.teams.split(" vs ")
@@ -717,6 +727,7 @@ export default function WorldCupSchedule() {
   const [nextMatch,     setNextMatch]     = useState<Match|null>(null)
   const [liveData,       setLiveData]       = useState<LiveFixture[]>([])
   const [todayData,      setTodayData]      = useState<TodayFixture[]>([])
+  const [resultsData,    setResultsData]    = useState<ResultFixture[]>([])
   const [finishedScores, setFinishedScores] = useState<Record<string, FinishedScore>>(() => {
     // Rehydrate from localStorage on first render (client only)
     if (typeof window === "undefined") return {}
@@ -758,6 +769,15 @@ export default function WorldCupSchedule() {
       .then(d => { if (d?.fixtures) setTodayData(d.fixtures) })
       .catch(() => {})
   }, [today])
+
+  // Fetch all results since tournament start - the primary source for
+  // finished scores and group table calculations across all matchdays.
+  useEffect(() => {
+    fetch("/api/results")
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.fixtures) setResultsData(d.fixtures) })
+      .catch(() => {})
+  }, [])
 
   const fetchLive = useCallback(async (manual = false) => {
     if (!manual && !isLiveWindow()) return
@@ -815,7 +835,7 @@ export default function WorldCupSchedule() {
 
   // Convenience wrapper using component state
   function getScore(match: Match): ScoreResult | null {
-    return getMatchScore(match, liveData, todayData, finishedScores)
+    return getMatchScore(match, liveData, resultsData, finishedScores)
   }
 
   const grouped = useMemo(() => {
@@ -837,8 +857,8 @@ export default function WorldCupSchedule() {
   const filteredTeams  = TEAM_LIST.filter(t => t.toLowerCase().includes(teamSearch)).slice(0,12)
   const anyLive        = liveData.some(l => LIVE_STATUSES.has(l.status))
   const groupTables    = useMemo(
-    () => calculateGroupTables(ALL_MATCHES, liveData, todayData, finishedScores),
-    [liveData, todayData, finishedScores]
+    () => calculateGroupTables(ALL_MATCHES, liveData, resultsData, finishedScores),
+    [liveData, resultsData, finishedScores]
   )
 
   return (
