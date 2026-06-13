@@ -1047,7 +1047,7 @@ export default function WorldCupSchedule() {
                                 {isDoneNow && !isLiveNow && (
                                   <span className="ml-2 text-[10px] font-bold text-[var(--pitch-bright)] uppercase">FT</span>
                                 )}
-                                {match.simultaneous && !liveF && (
+                                {match.simultaneous && !score && (
                                   <span className="ml-1.5 inline-flex items-center gap-0.5 text-[10px] font-bold text-[var(--amber)]">
                                     <Zap className="h-2.5 w-2.5" /> simultaneous
                                   </span>
